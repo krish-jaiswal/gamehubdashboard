@@ -1,0 +1,190 @@
+{
+  "name": "IG Discovery Pipeline - Daily",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP CHECKLIST (read me first)\n\n1. Create the Google Sheet \"IG Discovery Dashboard\" with 4 tabs:\n   References | Daily Pulls | Trend Signals | Posted Log\n   (use the CSV templates or the Apps Script in /google-sheets)\n\n2. In **Read References** and **Append to Daily Pulls** nodes:\n   - pick your Google Sheets credential\n   - re-select the documentId (the sheet) and the sheetName tab\n     from the dropdowns.\n\n3. In **Call Apify Instagram Scraper**:\n   - sign up free at apify.com → Settings → API & Integrations\n   - copy your token and replace PASTE_YOUR_APIFY_TOKEN_HERE in the URL.\n\n4. In **Notify on Telegram**:\n   - create a bot via @BotFather, add its token as a Telegram credential\n   - replace PASTE_YOUR_TELEGRAM_CHAT_ID_HERE with your numeric chat id.\n\n5. Click **Execute Workflow** once. When green, flip **Active** ON.\n   Runs daily 07:00 Asia/Kolkata (workflow timezone is set in Settings).",
+        "height": 460,
+        "width": 420
+      },
+      "id": "sticky-setup",
+      "name": "Setup Checklist",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-160, -40]
+    },
+    {
+      "parameters": {
+        "content": "## How the EngagementScore works\n\nWe don't have follower counts per post, so a raw like-count\nfavours big accounts. Instead this pipeline ranks by\n**engagement velocity** = (likes + comments x 5) / hours since posted.\n\nThis surfaces fast-rising / trending videos rather than just\nold viral posts. Tune COMMENT_WEIGHT and TOP_N inside the\n\"Score & Format Posts\" node.\n\nOnly video / reel content is kept (that's what you repost).",
+        "height": 320,
+        "width": 380
+      },
+      "id": "sticky-score",
+      "name": "Scoring Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1100, 360]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 7,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "node-schedule",
+      "name": "Every Day 07:00 IST",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 220]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "References",
+          "mode": "list",
+          "cachedResultName": "References"
+        },
+        "options": {}
+      },
+      "id": "node-read-refs",
+      "name": "Read References",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [320, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collect the Instagram handles from the References tab into a single\n// username array for one Apify run (cheaper + faster than one run each).\nconst handles = [];\nfor (const item of $input.all()) {\n  const raw = item.json.Handle ?? item.json.handle ?? '';\n  const h = String(raw).trim().replace(/^@/, '').replace(/\\/$/, '');\n  if (h) handles.push(h);\n}\n\nconst usernames = [...new Set(handles)];\nif (usernames.length === 0) {\n  throw new Error('No handles found in the References tab. Add at least one handle in the \"Handle\" column (no @, no URL).');\n}\n\nreturn [{ json: { usernames } }];"
+      },
+      "id": "node-build-input",
+      "name": "Build Apify Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token=PASTE_YOUR_APIFY_TOKEN_HERE",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  username: $json.usernames,\n  resultsType: 'posts',\n  resultsLimit: 10,\n  onlyPostsNewerThan: '2 days',\n  addParentData: true\n}) }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "node-apify",
+      "name": "Call Apify Instagram Scraper",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [800, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Apify run-sync-get-dataset-items returns a JSON array of post objects.\n// Depending on n8n's HTTP node it can arrive either as one item whose\n// json IS the array, or as many items. Handle both.\nconst input = $input.all();\nlet posts = [];\nif (input.length === 1 && Array.isArray(input[0].json)) {\n  posts = input[0].json;\n} else {\n  posts = input.map((i) => i.json).filter(Boolean);\n}\n\nconst today = new Date().toISOString().slice(0, 10);\nconst COMMENT_WEIGHT = 5; // comments are scarcer than likes -> weight them\nconst TOP_N = 25;\n\nconst rows = [];\nfor (const p of posts) {\n  if (!p || typeof p !== 'object') continue;\n\n  // keep only video / reel content (that's what gets reposted)\n  const type = p.type || '';\n  const productType = p.productType || '';\n  const isVideo =\n    type === 'Video' ||\n    productType === 'clips' ||\n    typeof p.videoViewCount === 'number' ||\n    typeof p.videoPlayCount === 'number';\n  if (!isVideo) continue;\n\n  const likes = Number(p.likesCount) || 0;\n  const comments = Number(p.commentsCount) || 0;\n  const postedAt = p.timestamp || '';\n\n  let hours = 24;\n  if (postedAt) {\n    const diffMs = Date.now() - new Date(postedAt).getTime();\n    if (!Number.isNaN(diffMs)) hours = Math.max(diffMs / 3600000, 1);\n  }\n\n  const velocity = (likes + comments * COMMENT_WEIGHT) / hours;\n  const score = Math.round(velocity);\n\n  rows.push({\n    Date: today,\n    SourceHandle:\n      p.ownerUsername || (p.parentData && p.parentData.username) || p.inputUrl || '',\n    VideoURL: p.url || '',\n    Likes: likes,\n    Comments: comments,\n    PostedAt: postedAt,\n    EngagementScore: score,\n  });\n}\n\nrows.sort((a, b) => b.EngagementScore - a.EngagementScore);\nreturn rows.slice(0, TOP_N).map((r) => ({ json: r }));"
+      },
+      "id": "node-score",
+      "name": "Score & Format Posts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 220]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "PASTE_YOUR_SHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Daily Pulls",
+          "mode": "list",
+          "cachedResultName": "Daily Pulls"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": [],
+          "value": {}
+        },
+        "options": {}
+      },
+      "id": "node-append",
+      "name": "Append to Daily Pulls",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1320, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build one Telegram digest message from the scored rows.\nconst rows = $('Score & Format Posts').all().map((i) => i.json);\nconst today = new Date().toISOString().slice(0, 10);\n\nif (rows.length === 0) {\n  return [{ json: { message: `IG Discovery ${today}: no new videos passed the filters today.` } }];\n}\n\nconst lines = [];\nlines.push(`\\uD83D\\uDCCA IG Discovery \\u2014 ${today}`);\nlines.push(`${rows.length} trending videos pulled from your reference accounts.`);\nlines.push('');\n\nrows.slice(0, 5).forEach((r, idx) => {\n  lines.push(`${idx + 1}. @${r.SourceHandle}  \\u2022  score ${r.EngagementScore}`);\n  lines.push(`   ${r.Likes} likes \\u00B7 ${r.Comments} comments`);\n  lines.push(`   ${r.VideoURL}`);\n});\n\nlines.push('');\nlines.push('Full list is in the Daily Pulls tab of your sheet.');\n\nreturn [{ json: { message: lines.join('\\n') } }];"
+      },
+      "id": "node-tg-msg",
+      "name": "Build Telegram Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1600, 220]
+    },
+    {
+      "parameters": {
+        "chatId": "PASTE_YOUR_TELEGRAM_CHAT_ID_HERE",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "node-telegram",
+      "name": "Notify on Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1840, 220]
+    }
+  ],
+  "connections": {
+    "Every Day 07:00 IST": {
+      "main": [[{ "node": "Read References", "type": "main", "index": 0 }]]
+    },
+    "Read References": {
+      "main": [[{ "node": "Build Apify Input", "type": "main", "index": 0 }]]
+    },
+    "Build Apify Input": {
+      "main": [[{ "node": "Call Apify Instagram Scraper", "type": "main", "index": 0 }]]
+    },
+    "Call Apify Instagram Scraper": {
+      "main": [[{ "node": "Score & Format Posts", "type": "main", "index": 0 }]]
+    },
+    "Score & Format Posts": {
+      "main": [[{ "node": "Append to Daily Pulls", "type": "main", "index": 0 }]]
+    },
+    "Append to Daily Pulls": {
+      "main": [[{ "node": "Build Telegram Summary", "type": "main", "index": 0 }]]
+    },
+    "Build Telegram Summary": {
+      "main": [[{ "node": "Notify on Telegram", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  },
+  "pinData": {},
+  "meta": {
+    "templatecredsSetupCompleted": false
+  },
+  "tags": []
+}
