@@ -1,0 +1,10 @@
+# local n8n / secrets
+.env
+*.local
+.n8n/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
